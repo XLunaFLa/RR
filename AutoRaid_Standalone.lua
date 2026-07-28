@@ -259,24 +259,78 @@ task.spawn(function()
 end)
 
 --  LISTENER: UpdateRaidInfo / EnterRaidsUpdateInfo (data raidId + grade dari server) 
+-- [PORT PERSIS dari file original baris 6812-6914] Perbedaan dengan versi awal aku:
+--   1) Wajib cek data.action ("RemoveRaidEnters" vs data normal), bukan diabaikan.
+--   2) raidInfos di-iterasi pakai pairs() BUKAN ipairs() -- server bisa kirim
+--      raidInfos sebagai dict {[raidId]=info}, ipairs() bakal skip semua data itu.
+--   3) mapId dari server formatnya 50101-50120 (raid map aktif) -> HARUS dikurangi
+--      100 dulu supaya jadi basemap number 50001-50020 sebelum disimpan ke RAID_LIVE.
+--   4) Grade pakai fallback chain: RAID_CONFIG_GRADE[raidId] -> _runeGradeCache -> "?"
+--      (bagian _ASC_CHAT_CACHE dibuang karena ini standalone RAID normal only).
+--   5) Merge ke tempKey (-mapId) supaya grade lama dari watcher tidak hilang kalau
+--      data baru grade-nya masih "?".
+_runeGradeCache = _runeGradeCache or {}
+
 local function ConnectRaidListeners()
     if RE_UpdateRaidInfo then
         RE_UpdateRaidInfo.OnClientEvent:Connect(function(data)
             if type(data) ~= "table" then return end
+            local action = data.action
             local raidInfos = data.raidInfos
             if type(raidInfos) ~= "table" then return end
-            Log("[DIAG] UpdateRaidInfo event masuk (" .. #raidInfos .. " raidInfos)")
-            for _, info in ipairs(raidInfos) do
-                if type(info) == "table" and info.raidId then
-                    local mapId = info.mapId or (RAID_LIVE[info.raidId] and RAID_LIVE[info.raidId].mapId)
-                    if mapId then
-                        RAID_LIVE[info.raidId] = {
-                            raidId = info.raidId, mapId = mapId,
-                            grade = RAID_CONFIG_GRADE[info.raidId] or info.grade or "?",
-                            endTime = info.endTime,
-                        }
-                    end
+
+            if action == "RemoveRaidEnters" then
+                Log("[DIAG] UpdateRaidInfo: action=RemoveRaidEnters")
+                for k in pairs(raidInfos) do
+                    local raidId = type(k) == "number" and k or tonumber(k)
+                    if raidId and raidId ~= 937101 then RAID_LIVE[raidId] = nil end
                 end
+                RebuildRaidList()
+                return
+            end
+
+            local _count = 0
+            for _ in pairs(raidInfos) do _count = _count + 1 end
+            Log("[DIAG] UpdateRaidInfo event masuk (" .. _count .. " raidInfos, action=" .. tostring(action) .. ")")
+
+            for k, info in pairs(raidInfos) do
+                repeat
+                    if type(info) ~= "table" then break end
+                    local raidId = info.raidId or (type(k) == "number" and k) or tonumber(k)
+                    local mapId = info.mapId
+                    if not raidId or not mapId then break end
+                    if raidId == 937101 then break end          -- exclude Anniversary
+                    if raidId >= 935001 then break end           -- exclude Ascension Tower (di luar scope standalone ini)
+                    -- [FIX PENTING] Server kirim mapId dalam format 50101-50120 (map aktif)
+                    -- harus dikurangi 100 supaya jadi basemap 50001-50020
+                    if mapId >= 50101 and mapId <= 50120 then mapId = mapId - 100 end
+                    if mapId < 50001 or mapId > 50020 then break end -- bukan Normal Raid map
+
+                    local mapNum = mapId - 50000
+                    local spawnName = info.spawnName or "RE1001"
+                    local grade = (RAID_CONFIG_GRADE and RAID_CONFIG_GRADE[raidId])
+                        or (_runeGradeCache and _runeGradeCache[mapNum])
+                        or "?"
+
+                    local tempKey = -(mapId)
+                    local entryData = {
+                        raidId = raidId, mapId = mapId, spawnName = spawnName,
+                        grade = grade, endTime = info.endTime,
+                    }
+
+                    if RAID_LIVE[tempKey] then
+                        -- Merge: kalau grade baru "?" tapi entry lama sudah punya grade valid, pertahankan
+                        if grade == "?" and RAID_LIVE[tempKey].grade and RAID_LIVE[tempKey].grade ~= "?" then
+                            entryData.grade = RAID_LIVE[tempKey].grade
+                        end
+                        RAID_LIVE[raidId] = entryData
+                        RAID_LIVE[tempKey] = nil
+                    elseif not RAID_LIVE[raidId] then
+                        RAID_LIVE[raidId] = entryData
+                    else
+                        RAID_LIVE[raidId].grade = grade
+                    end
+                until true
             end
             RebuildRaidList()
         end)
@@ -284,11 +338,36 @@ local function ConnectRaidListeners()
     if RE_EnterRaidsUpdate then
         RE_EnterRaidsUpdate.OnClientEvent:Connect(function(data)
             if type(data) ~= "table" then return end
+            if data.slotIndex == nil and data.fromMapId == nil and data.mapId == nil then return end
+            if data.slotIndex then RAID.slotIndex = data.slotIndex end
+            if data.fromMapId then RAID.fromMapId = data.fromMapId end
+            if data.mapId then
+                local mid = data.mapId
+                if mid >= 50101 and mid <= 50120 then RAID.serverMapId = mid end
+            end
             RebuildRaidList()
         end)
     end
 end
 ConnectRaidListeners()
+
+-- [PORT dari file original] Auto-reconnect kalau Remotes.UpdateRaidInfo berubah
+-- referensinya (mis. setelah rejoin) supaya listener tidak mati diam-diam.
+task.spawn(function()
+    local lastRef = Remotes:FindFirstChild("UpdateRaidInfo")
+    while true do
+        task.wait(3)
+        local cur = Remotes:FindFirstChild("UpdateRaidInfo")
+        if cur ~= lastRef then
+            lastRef = cur
+            RE_UpdateRaidInfo = cur
+            if cur then
+                Log("[DIAG] Remote UpdateRaidInfo berubah referensi - reconnect listener")
+                ConnectRaidListeners()
+            end
+        end
+    end
+end)
 
 --  RESOLVE ENTRY: RAID LIST ENTRY (Map 20, Rank E-A) 
 local function ResolveEntryFromList()
