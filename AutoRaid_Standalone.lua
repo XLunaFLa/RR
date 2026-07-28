@@ -212,6 +212,7 @@ local function _onRaidChildAdded(child, slotName)
         raidId = tempKey, mapId = mapId, spawnName = slotName or "RE1001",
         rank = 0, grade = "?", endTime = nil, _tempEntry = true,
     }
+    Log("[DIAG] Watcher deteksi RaidEnter" .. mapNum .. " (Map " .. mapNum .. ") via " .. tostring(slotName))
     RebuildRaidList()
 end
 
@@ -233,13 +234,27 @@ end
 
 task.spawn(function()
     local ok, mapsF = pcall(function() return workspace:WaitForChild("Maps", 15) end)
-    if not ok or not mapsF then return end
+    if not ok or not mapsF then
+        Log("[DIAG] workspace.Maps TIDAK ditemukan dalam 15 detik - watcher raid tidak aktif!")
+        return
+    end
     local ok2, mapF = pcall(function() return mapsF:WaitForChild("Map", 10) end)
-    if not ok2 or not mapF then return end
+    if not ok2 or not mapF then
+        Log("[DIAG] workspace.Maps.Map TIDAK ditemukan dalam 10 detik - watcher raid tidak aktif!")
+        return
+    end
     local ok3, reF = pcall(function() return mapF:WaitForChild("RaidEnter", 10) end)
-    if not ok3 or not reF then return end
+    if not ok3 or not reF then
+        Log("[DIAG] workspace.Maps.Map.RaidEnter TIDAK ditemukan dalam 10 detik - watcher raid tidak aktif!")
+        return
+    end
     local re1 = reF:WaitForChild("RE1001", 5)
     local re2 = reF:WaitForChild("RE1002", 5)
+    if not re1 and not re2 then
+        Log("[DIAG] RE1001/RE1002 tidak ditemukan di RaidEnter - cek apakah nama folder slot berubah.")
+    else
+        Log("[DIAG] Watcher raid aktif (RE1001=" .. tostring(re1 ~= nil) .. ", RE1002=" .. tostring(re2 ~= nil) .. ")")
+    end
     _watchRaidSlot(re1); _watchRaidSlot(re2)
 end)
 
@@ -250,6 +265,7 @@ local function ConnectRaidListeners()
             if type(data) ~= "table" then return end
             local raidInfos = data.raidInfos
             if type(raidInfos) ~= "table" then return end
+            Log("[DIAG] UpdateRaidInfo event masuk (" .. #raidInfos .. " raidInfos)")
             for _, info in ipairs(raidInfos) do
                 if type(info) == "table" and info.raidId then
                     local mapId = info.mapId or (RAID_LIVE[info.raidId] and RAID_LIVE[info.raidId].mapId)
@@ -325,6 +341,31 @@ local function ResolveEntry()
     -- Tahap 2: Fallback Manual (Map 16-19 semua rank yang diizinkan)
     return ResolveEntryManualFallback()
 end
+
+--  DIAGNOSTIK: dump isi RAID_ID_LIST + grade yang terbaca (dipanggil tiap N detik saat waiting) 
+local function DumpRaidListDiagnostic()
+    if #RAID_ID_LIST == 0 then
+        Log("[DIAG] RAID_ID_LIST kosong - belum ada raid entry terdeteksi sama sekali di RAID_LIVE.")
+        Log("[DIAG] Cek: apakah workspace.Maps.Map.RaidEnter.RE1001/RE1002 ada isinya? Apakah remote UpdateRaidInfo / EnterRaidsUpdateInfo ke-fire?")
+        return
+    end
+    Log("[DIAG] Isi RAID_ID_LIST saat ini (" .. #RAID_ID_LIST .. " entri):")
+    for _, r in ipairs(RAID_ID_LIST) do
+        local mn = r.mapId - 50000
+        local grade = GetBestGrade(mn)
+        local inList   = LIST_ENTRY.maps[mn] and "YA" or "tidak"
+        local inManual = MANUAL_FALLBACK.maps[mn] and "YA" or "tidak"
+        Log(string.format(
+            "[DIAG]  Map %d | raidId=%s | grade=%s | target List Entry=%s | target Manual Fallback=%s",
+            mn, tostring(r.id), tostring(grade or "nil/?"), inList, inManual
+        ))
+    end
+end
+
+local RE_UpdateRaidInfoName   = RE_UpdateRaidInfo and RE_UpdateRaidInfo.Name or "TIDAK DITEMUKAN"
+local RE_EnterRaidsUpdateName = RE_EnterRaidsUpdate and RE_EnterRaidsUpdate.Name or "TIDAK DITEMUKAN"
+Log("[DIAG] Remote UpdateRaidInfo: " .. RE_UpdateRaidInfoName)
+Log("[DIAG] Remote EnterRaidsUpdateInfo: " .. RE_EnterRaidsUpdateName)
 
 --  SAFE REEQUIP HERO SETELAH TELEPORT 
 local _SafeReequipBusy = false
@@ -436,8 +477,14 @@ local function StartRaidLoop()
                 RebuildRaidList()
 
                 local raidEntry = ResolveEntry()
+                local _waitTick = 0
                 while RAID.running and not raidEntry do
                     task.wait(1)
+                    _waitTick = _waitTick + 1
+                    if _waitTick % 5 == 0 then
+                        Log("Masih menunggu raid match... (sudah " .. _waitTick .. "s)")
+                        DumpRaidListDiagnostic()
+                    end
                     raidEntry = ResolveEntry()
                 end
                 if not RAID.running then break end
