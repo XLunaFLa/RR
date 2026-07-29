@@ -122,7 +122,12 @@ local _defaultRRIdx = 0
 local RAID = {
     running=false, inMap=false, raidId=nil, raidMapId=nil, serverMapId=nil,
     fromMapId=nil, slotIndex=2, sukses=0, collected=0,
+    _cooldownActive=false, _listVisitedMaps={},
 }
+
+-- BindableEvent wakeup: di-fire saat RAID_LIVE berubah agar standby loop
+-- tidak harus nunggu 1 detik penuh tiap cycle (sama persis referensi)
+local _raidWakeup = Instance.new("BindableEvent")
 
 local function Log(msg)
     print("[AutoRaid] " .. tostring(msg))
@@ -192,6 +197,8 @@ local function RebuildRaidList()
     for _, e in ipairs(sorted) do
         table.insert(RAID_ID_LIST, { id = e.raidId, mapId = e.mapId, rank = e.rank })
     end
+    -- Wake standby loop agar tidak perlu tunggu 1s penuh
+    pcall(function() _raidWakeup:Fire() end)
 end
 
 --  WORKSPACE WATCHER: RE1001/RE1002 (deteksi lobby raid via child ChildAdded) 
@@ -223,6 +230,33 @@ local function _onRaidChildRemoved(child)
         if ent.mapId == mapId then RAID_LIVE[rid] = nil; changed = true end
     end
     if changed then RebuildRaidList() end
+end
+
+--  ForceRescanRaidEnter: paksa scan ulang workspace.Maps.Map.RaidEnter 
+--  Dideklarasikan SETELAH _onRaidChildAdded agar tidak forward-reference error.
+--  Dipanggil tiap 3 detik selama cooldown agar RAID_LIVE selalu fresh.
+local function ForceRescanRaidEnter()
+    pcall(function()
+        local mapsF = workspace:FindFirstChild("Maps"); if not mapsF then return end
+        local mapF  = mapsF:FindFirstChild("Map");     if not mapF  then return end
+        local reF   = mapF:FindFirstChild("RaidEnter"); if not reF  then return end
+        for _, slot in ipairs(reF:GetChildren()) do
+            for _, child in ipairs(slot:GetChildren()) do
+                _onRaidChildAdded(child, slot.Name)
+            end
+        end
+    end)
+end
+
+--  IsRaidLiveInGame: cek apakah ada minimal 1 raid aktif di workspace 
+local function IsRaidLiveInGame()
+    local mapsF = workspace:FindFirstChild("Maps"); if not mapsF then return false end
+    local mapF  = mapsF:FindFirstChild("Map");     if not mapF  then return false end
+    local reF   = mapF:FindFirstChild("RaidEnter"); if not reF  then return false end
+    for _, slot in ipairs(reF:GetChildren()) do
+        if #slot:GetChildren() > 0 then return true end
+    end
+    return #RAID_ID_LIST > 0
 end
 
 local function _watchRaidSlot(reFolder)
@@ -370,21 +404,39 @@ task.spawn(function()
 end)
 
 --  RESOLVE ENTRY: RAID LIST ENTRY (Map 20, Rank E-A) 
+--  [PORT dari referensi] Pakai _listVisitedMaps untuk rotasi siklus:
+--  kalau semua map yang match sudah dikunjungi, reset visited lalu mulai ulang.
 local function ResolveEntryFromList()
     if #RAID_ID_LIST == 0 then return nil end
-    local matched = {}
-    for _, r in ipairs(RAID_ID_LIST) do
-        local mn = r.mapId - 50000
-        if LIST_ENTRY.maps[mn] then
-            local grade = GetBestGrade(mn)
-            if grade and LIST_ENTRY.ranks[grade] then
-                table.insert(matched, r)
+
+    local function collectMatched(skipVisited)
+        local allMatched = {}
+        local seen = {}
+        for _, r in ipairs(RAID_ID_LIST) do
+            if seen[r.mapId] then continue end
+            if skipVisited and RAID._listVisitedMaps[r.mapId] then continue end
+            local mn = r.mapId - 50000
+            if LIST_ENTRY.maps[mn] then
+                local grade = GetBestGrade(mn)
+                if grade and LIST_ENTRY.ranks[grade] then
+                    table.insert(allMatched, r)
+                    seen[r.mapId] = true
+                end
             end
         end
+        return allMatched
     end
-    if #matched == 0 then return nil end
-    table.sort(matched, function(a, b) return a.mapId < b.mapId end)
-    return matched[1]
+
+    -- Tahap 1: cari yang belum dikunjungi siklus ini
+    local allMatched = collectMatched(true)
+    -- Tahap 2: kalau semua sudah dikunjungi -> reset visited dan coba lagi
+    if #allMatched == 0 then
+        for k in pairs(RAID._listVisitedMaps) do RAID._listVisitedMaps[k] = nil end
+        allMatched = collectMatched(true)
+    end
+    if #allMatched == 0 then return nil end
+    table.sort(allMatched, function(a, b) return a.mapId < b.mapId end)
+    return allMatched[1]
 end
 
 --  RESOLVE ENTRY: FALLBACK MANUAL (Map 16-19, Rank E/D/C/B/A/S/SS/G/N/M/M+) 
@@ -558,6 +610,7 @@ local function StartRaidLoop()
                 local raidEntry = ResolveEntry()
                 local _waitTick = 0
                 while RAID.running and not raidEntry do
+                    ForceRescanRaidEnter()
                     task.wait(1)
                     _waitTick = _waitTick + 1
                     if _waitTick % 5 == 0 then
@@ -826,22 +879,109 @@ local function StartRaidLoop()
                 RAID_LIVE[RAID.raidId] = nil
                 RebuildRaidList()
 
+                -- Tandai map ini sudah dikunjungi siklus ini (untuk _listVisitedMaps rotasi)
+                if raidEntry and raidEntry.mapId then
+                    RAID._listVisitedMaps[raidEntry.mapId] = true
+                end
+
                 local _toMapId = (RAID.fromMapId and RAID.fromMapId >= 50001 and RAID.fromMapId <= 50020) and RAID.fromMapId or 50001
-                if RE.QuitRaidsMap then
-                    pcall(function() RE.QuitRaidsMap:FireServer({ currentSlotIndex = RAID.slotIndex or 2, toMapId = _toMapId }) end)
+
+                -- Helper cek apakah masih di dalam area raid
+                local function _inRaidArea()
+                    local ok = false
+                    pcall(function()
+                        local wm = workspace:GetAttribute("MapId") or workspace:GetAttribute("mapId") or workspace:GetAttribute("CurrentMapId")
+                        if wm then ok = (wm >= 50101 and wm <= 50120) end
+                    end)
+                    return ok
+                end
+
+                local _quitRe = Remotes:FindFirstChild("QuitRaidsMap")
+                if _quitRe then
+                    pcall(function() _quitRe:FireServer({ currentSlotIndex = RAID.slotIndex or 2, toMapId = _toMapId }) end)
                 end
                 task.wait(0.3)
                 if RE.StartTp then
                     pcall(function() RE.StartTp:FireServer({ mapId = _toMapId }) end)
                 end
 
+                -- [PORT referensi] Retry exit max 5x kalau masih di area raid
+                local _exitTry = 0
+                while _inRaidArea() and _exitTry < 5 and RAID.running do
+                    _exitTry = _exitTry + 1
+                    task.wait(1)
+                    if _quitRe then
+                        pcall(function() _quitRe:FireServer({ currentSlotIndex = RAID.slotIndex or 2, toMapId = _toMapId }) end)
+                    end
+                    task.wait(0.2)
+                    if RE.StartTp then
+                        pcall(function() RE.StartTp:FireServer({ mapId = _toMapId }) end)
+                    end
+                end
+
                 RAID.inMap = false
+                RAID.fromMapId = nil
                 RAID.raidId = nil
                 RAID.raidMapId = nil
                 RAID.serverMapId = nil
-                RAID.fromMapId = nil
 
-                task.wait(1)
+                -- STEP 6: Cooldown 14 detik (port PERSIS dari referensi baris 8454-8473)
+                -- Server butuh ~12-14 detik sebelum bisa masuk Raid lagi.
+                -- Selama cooldown: rescan workspace tiap 3 detik agar RAID_LIVE fresh.
+                -- Flag _cooldownActive mencegah standby loop masuk terlalu cepat.
+                RAID._cooldownActive = true
+                for cd = 14, 1, -1 do
+                    if not RAID.running then break end
+                    if cd % 3 == 0 then ForceRescanRaidEnter() end
+                    Log("[Cooldown] " .. cd .. "s...")
+                    task.wait(1)
+                end
+                RAID._cooldownActive = false
+
+                -- [PORT referensi baris 8465-8473] Buffer +2 detik khusus List Entry
+                -- mencegah "terlalu cepat masuk raid lagi" dari server
+                if #RAID_ID_LIST > 0 then
+                    Log("[Cooldown] List Entry buffer 2s...")
+                    for _bf = 2, 1, -1 do
+                        if not RAID.running then break end
+                        task.wait(1)
+                    end
+                end
+
+                -- STEP 7: Standby loop - polling agresif 0.1s via _raidWakeup event
+                -- [PORT referensi baris 8479-8529]
+                -- Tidak masuk raid selama _cooldownActive=true atau RAID_LIVE kosong.
+                if RAID.running then
+                    Log("[Standby] Menunggu raid match baru...")
+                    local _fw = 0
+                    while RAID.running do
+                        ForceRescanRaidEnter()
+
+                        if not RAID._cooldownActive and IsRaidLiveInGame() then
+                            local _newEntry = ResolveEntry()
+                            if _newEntry then
+                                raidEntry = _newEntry
+                                Log("[Standby] Match ditemukan setelah " .. _fw .. "s - lanjut masuk raid")
+                                break
+                            end
+                            Log("[Standby] Waiting grade filter... (" .. _fw .. "s)")
+                        else
+                            Log("[Standby] Empty RAID - Waiting event baru... (" .. _fw .. "s)")
+                        end
+
+                        -- Poll 0.1s tiap wake, max 1 detik per cycle (sama seperti referensi)
+                        local _woken = false
+                        local _wConn
+                        _wConn = _raidWakeup.Event:Connect(function() _woken = true end)
+                        local _we = 0
+                        while not _woken and _we < 1 and RAID.running do
+                            task.wait(0.1); _we = _we + 0.1
+                        end
+                        pcall(function() _wConn:Disconnect() end)
+                        _fw = _fw + 1
+                    end
+                end
+
             until true
         end
     end)
