@@ -248,15 +248,23 @@ local function ForceRescanRaidEnter()
     end)
 end
 
---  IsRaidLiveInGame: cek apakah ada minimal 1 raid aktif di workspace 
+--  IsRaidLiveInGame: cek apakah ada minimal 1 raid aktif
+--  Prioritas: RAID_ID_LIST (data dari event listener) -> workspace fisik
+--  Jangan balik false hanya karena workspace.Maps tidak ada —
+--  folder itu tidak selalu exist saat player di lobby normal.
 local function IsRaidLiveInGame()
-    local mapsF = workspace:FindFirstChild("Maps"); if not mapsF then return false end
-    local mapF  = mapsF:FindFirstChild("Map");     if not mapF  then return false end
-    local reF   = mapF:FindFirstChild("RaidEnter"); if not reF  then return false end
-    for _, slot in ipairs(reF:GetChildren()) do
-        if #slot:GetChildren() > 0 then return true end
-    end
-    return #RAID_ID_LIST > 0
+    if #RAID_ID_LIST > 0 then return true end
+    -- Fallback: cek workspace fisik (RE1001/RE1002 children)
+    local _found = false
+    pcall(function()
+        local mapsF = workspace:FindFirstChild("Maps"); if not mapsF then return end
+        local mapF  = mapsF:FindFirstChild("Map");     if not mapF  then return end
+        local reF   = mapF:FindFirstChild("RaidEnter"); if not reF  then return end
+        for _, slot in ipairs(reF:GetChildren()) do
+            if #slot:GetChildren() > 0 then _found = true; return end
+        end
+    end)
+    return _found
 end
 
 local function _watchRaidSlot(reFolder)
