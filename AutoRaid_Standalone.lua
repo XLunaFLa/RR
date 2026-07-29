@@ -6021,6 +6021,25 @@ do
         end,
     })
 
+    -- ─── AUTO LOAD CONFIG SAAT EXECUTE ───────────────────────────────────────
+    -- Dipanggil SETELAH semua UI WindUI selesai di-build (semua _setXxx setter
+    -- sudah ter-assign) supaya ApplyConfig bisa update visual dengan benar.
+    -- task.delay(2) memberi jeda agar:
+    --   1. WindUI selesai render semua element
+    --   2. Semua _setRaidToggle / _setRaidPMIdx / dll sudah tidak nil
+    --   3. RAID_LIVE sudah mulai terisi dari listener event pertama
+    task.delay(2, function()
+        local cfg = LoadConfigByName(SINGLE_CONFIG_NAME)
+        if type(cfg) == "table" then
+            ApplyConfig(cfg)
+            SetStatus("Auto-load config berhasil. (" .. os.date("%H:%M:%S") .. ")")
+            print("[FLa Config] Auto-load: config diterapkan.")
+        else
+            SetStatus("Belum ada config tersimpan. Atur fitur lalu klik SAVE CONFIG.")
+            print("[FLa Config] Auto-load: tidak ada config tersimpan, skip.")
+        end
+    end)
+
 end -- end do PANEL CONFIG
 
 -- ════════════════════════════════════════════════════════════════════════════
