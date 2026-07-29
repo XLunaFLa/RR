@@ -1792,16 +1792,26 @@ local function ResolveEntry()
                     end
                     if #valid_raids == 0 then return nil end
 
-                    -- Helper: Sort dari Rank tertinggi ke terendah
+                    -- Helper: Sort dari Rank tertinggi ke terendah (dipakai TAHAP 2 UP/DOWN,
+                    -- di mana semua kandidat sudah pasti 1 grade yang sama persis)
                     local function sortHighestRank(list)
                         table.sort(list, function(a, b)
                             local ga = _getGrade(a) or "?"
                             local gb = _getGrade(b) or "?"
                             local ra = GRADE_RANK[ga] or 0
                             local rb = GRADE_RANK[gb] or 0
-                            if ra == rb then return a.mapId < b.mapId end 
+                            if ra == rb then return a.mapId > b.mapId end 
                             return ra > rb 
                         end)
+                    end
+
+                    -- [FIX] Helper BARU untuk TAHAP 1: prioritas MAP TERTINGGI, bukan Rank tertinggi.
+                    -- `matched` di TAHAP 1 sudah pasti lolos filter Preferred Rank (grade-nya sudah
+                    -- cocok E s/d M+ atau apapun yang dipilih user) -- jadi Rank TIDAK PERLU dipakai
+                    -- lagi sebagai kriteria urutan. Yang dicari sekarang murni Map paling tinggi di
+                    -- antara raid yang preferMaps + preferRank-nya sudah sama-sama cocok.
+                    local function sortHighestMap(list)
+                        table.sort(list, function(a, b) return a.mapId > b.mapId end)
                     end
 
                     -- 2. TAHAP 1: Cari kecocokan Preferred Rank
@@ -1826,8 +1836,8 @@ local function ResolveEntry()
                     end
 
                     if #matched > 0 then
-                        -- MATCH UTAMA KETEMU
-                        sortHighestRank(matched)
+                        -- MATCH UTAMA KETEMU -> menangkan Map TERTINGGI di antara yang Rank-nya sudah cocok
+                        sortHighestMap(matched)
                         RAID.manualMatchMode = "primary"
                         return matched[1]
                     end
