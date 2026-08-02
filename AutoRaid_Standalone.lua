@@ -54,13 +54,16 @@ if not Remotes then
     error("[FLa] Folder 'Remotes' tidak ketemu dalam 30 detik - coba tunggu lebih lama setelah masuk game sebelum execute.")
 end
 
--- [INIT] EquipLoadoutSave -- dipanggil sekali di awal, begitu script pertama
--- kali di-execute (sebelum fitur lain dibangun).
-pcall(function()
-    local args = {
-        1
-    }
-    Remotes:WaitForChild("EquipLoadoutSave"):InvokeServer(unpack(args))
+-- [INIT] EquipLoadoutSave -- dipanggil 10 detik setelah script di-execute.
+-- Pakai task.delay (non-blocking) supaya tidak menahan eksekusi baris-baris
+-- setelahnya selama 10 detik itu.
+task.delay(10, function()
+    pcall(function()
+        local args = {
+            1
+        }
+        Remotes:WaitForChild("EquipLoadoutSave"):InvokeServer(unpack(args))
+    end)
 end)
 
 
